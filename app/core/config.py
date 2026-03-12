@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     GOOGLE_CREDENTIALS_JSON: str
     GCS_BUCKET_NAME: str
     GOOGLE_CLOUD_REGION: str
+    JWT_SECRET: str
 
     model_config = SettingsConfigDict(
         env_file=".env",

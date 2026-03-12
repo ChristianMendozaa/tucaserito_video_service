@@ -7,17 +7,21 @@ def get_firestore_client() -> firestore.Client:
     creds = get_gcp_credentials()
     return firestore.Client(credentials=creds, project=settings.project_id)
 
-def create_video_job(video_id: str, operation_id: str, metadata: dict) -> None:
+def create_video_job(video_id: str, operation_id: str, metadata: dict, user_id: str = None) -> None:
     db = get_firestore_client()
     doc_ref = db.collection("video_jobs").document(video_id)
     
-    doc_ref.set({
+    doc_data = {
         "video_id": video_id,
         "operation_id": operation_id,
         "status": "PROCESSING",
         "created_at": firestore.SERVER_TIMESTAMP,
         "metadata": metadata
-    })
+    }
+    if user_id:
+        doc_data["user_id"] = user_id
+        
+    doc_ref.set(doc_data)
 
 def get_video_job(video_id: str) -> dict:
     db = get_firestore_client()
@@ -46,6 +50,21 @@ def list_video_jobs() -> list:
     for doc in docs:
         job = doc.to_dict()
         # Convert DatetimeWithNanoseconds to string for JSON serialization
+        if "created_at" in job and hasattr(job["created_at"], "isoformat"):
+            job["created_at"] = job["created_at"].isoformat()
+        if "updated_at" in job and hasattr(job["updated_at"], "isoformat"):
+            job["updated_at"] = job["updated_at"].isoformat()
+        jobs.append(job)
+        
+    return jobs
+
+def list_video_jobs_by_user(user_id: str) -> list:
+    db = get_firestore_client()
+    docs = db.collection("video_jobs").where("user_id", "==", user_id).order_by("created_at", direction=firestore.Query.DESCENDING).stream()
+    
+    jobs = []
+    for doc in docs:
+        job = doc.to_dict()
         if "created_at" in job and hasattr(job["created_at"], "isoformat"):
             job["created_at"] = job["created_at"].isoformat()
         if "updated_at" in job and hasattr(job["updated_at"], "isoformat"):

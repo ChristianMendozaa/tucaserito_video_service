@@ -2,12 +2,13 @@ import uuid
 from typing import List
 import logging
 import urllib.parse
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, status
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, status, Depends
 from pydantic import BaseModel
+from app.api.auth_deps import get_current_user_id
 
 from app.services.vertex_service import generate_video_async, extend_video_async, get_operation_status
 from app.services.gcs_service import get_output_uri, generate_signed_url, get_bucket
-from app.services.firestore_service import create_video_job, get_video_job, update_video_job, list_video_jobs
+from app.services.firestore_service import create_video_job, get_video_job, update_video_job, list_video_jobs, list_video_jobs_by_user
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -24,7 +25,8 @@ async def generate_video(
     prompt_veo_visual: str = Form(...),
     prompt_veo_audio: str = Form(""),
     aspect_ratio: str = Form("16:9"),
-    script_text: str = Form("")
+    script_text: str = Form(""),
+    user_id: str = Depends(get_current_user_id)
 ):
     try:
         if len(images) > 3:
@@ -56,7 +58,7 @@ async def generate_video(
             "script_text": script_text
         }
         
-        create_video_job(video_id, operation_name, metadata)
+        create_video_job(video_id, operation_name, metadata, user_id)
         
         logger.info(f"Started video generation: {video_id} (Operation: {operation_name})")
         
@@ -75,7 +77,7 @@ class VideoExtendRequest(BaseModel):
     script_text: str = ""
 
 @router.post("/extend", response_model=VideoGenerateResponse, status_code=status.HTTP_202_ACCEPTED)
-async def extend_video(req: VideoExtendRequest):
+async def extend_video(req: VideoExtendRequest, user_id: str = Depends(get_current_user_id)):
     try:
         # Verify the original video exists and is completed
         job = get_video_job(req.video_id)
@@ -111,7 +113,7 @@ async def extend_video(req: VideoExtendRequest):
             "script_text": req.script_text
         }
         
-        create_video_job(new_video_id, operation_name, metadata)
+        create_video_job(new_video_id, operation_name, metadata, user_id)
         
         logger.info(f"Started video extension: {new_video_id} from {req.video_id}")
         
@@ -148,6 +150,31 @@ async def get_all_videos():
     except Exception as e:
         logger.error(f"Error listing video jobs: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/my-videos")
+async def get_user_videos(user_id: str = Depends(get_current_user_id)):
+    try:
+        jobs = list_video_jobs_by_user(user_id)
+        updated_jobs = []
+        
+        for job in jobs:
+            # Auto-heal jobs that are stuck in PROCESSING state
+            if job.get("status") == "PROCESSING":
+                video_id = job.get("video_id")
+                try:
+                    # get_video_status will automatically update Firestore if it finished
+                    live_status = await get_video_status(video_id)
+                    job.update(live_status)
+                except Exception as ex:
+                    logger.warning(f"Error auto-updating status for {video_id}: {ex}")
+            # Ensure proper typing for datetime serialization, just in case firestore outputs DatetimeWithNanoseconds
+            updated_jobs.append(job)
+            
+        return {"videos": updated_jobs}
+    except Exception as e:
+        logger.error(f"Error listing user video jobs: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.get("/status/{video_id:path}")
 async def get_video_status(video_id: str):
