@@ -199,7 +199,7 @@ async def get_all_videos(request: Request):
                 video_id = job.get("video_id")
                 try:
                     # get_video_status will automatically update Firestore if it finished
-                    live_status = await get_video_status(video_id)
+                    live_status = await get_video_status(video_id, request)
                     job.update(live_status)
                 except Exception as ex:
                     logger.warning(f"Error auto-updating status for {video_id}: {ex}")
@@ -224,7 +224,7 @@ async def get_user_videos(request: Request, user_id: str = Depends(get_current_u
                 video_id = job.get("video_id")
                 try:
                     # get_video_status will automatically update Firestore if it finished
-                    live_status = await get_video_status(video_id)
+                    live_status = await get_video_status(video_id, request)
                     job.update(live_status)
                 except Exception as ex:
                     logger.warning(f"Error auto-updating status for {video_id}: {ex}")
