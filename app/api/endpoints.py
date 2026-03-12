@@ -214,7 +214,8 @@ async def get_all_videos(request: Request):
                 except Exception as ex:
                     logger.warning(f"Error auto-updating status for {video_id}: {ex}")
             # Ensure proper typing for datetime serialization, just in case firestore outputs DatetimeWithNanoseconds
-            updated_jobs.append(job)
+            if job.get("status") != "FAILED":
+                updated_jobs.append(job)
             
         return {"videos": updated_jobs}
     except Exception as e:
@@ -239,7 +240,8 @@ async def get_user_videos(request: Request, user_id: str = Depends(get_current_u
                 except Exception as ex:
                     logger.warning(f"Error auto-updating status for {video_id}: {ex}")
             # Ensure proper typing for datetime serialization, just in case firestore outputs DatetimeWithNanoseconds
-            updated_jobs.append(job)
+            if job.get("status") != "FAILED":
+                updated_jobs.append(job)
             
         return {"videos": updated_jobs}
     except Exception as e:
