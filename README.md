@@ -11,7 +11,7 @@ Debido a las estrictas regulaciones y requisitos de hardware del motor **Veo 3.1
 - Los videos se vuelcan *automáticamente* de Vertex AI a nuestro Cloud Storage `pneuma_bucket` evitando el uso intensivo de RAM del servidor en la mayoría de los casos.
 
 ---
-
+  
 ## 1. Generar Video (Base)
 Inicia un Image-to-Video generation job creando el anuncio principal de 8 segundos.
 
