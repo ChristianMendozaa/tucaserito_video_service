@@ -2,9 +2,15 @@ import uuid
 from typing import List
 import logging
 import urllib.parse
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, status, Depends
+import httpx
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, status, Depends, Request
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
+from cachetools import TTLCache
+import time
+
 from app.api.auth_deps import get_current_user_id
+from app.core.rate_limit import limiter
 
 from app.services.vertex_service import generate_video_async, extend_video_async, get_operation_status
 from app.services.gcs_service import get_output_uri, generate_signed_url, get_bucket
@@ -14,23 +20,66 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+security = HTTPBearer()
+
+# Cache to avoid spamming the subscription service on burst requests
+subs_cache = TTLCache(maxsize=1000, ttl=30)
+
+async def verify_can_generate(token: str):
+    """Verifica si el plan permite generar videos (sin descontar cuota). Con Caché de 30s."""
+    if token in subs_cache:
+        data = subs_cache[token]
+    else:
+        url = f"{settings.SUBSCRIPTION_SERVICE_URL}/api/v1/subscriptions/me"
+        headers = {"Authorization": f"Bearer {token}"}
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                subs_cache[token] = data
+            else:
+                raise HTTPException(status_code=403, detail="No autorizado o sin plan activo.")
+
+    if not data.get("can_generate_video", False) or data.get("videos_remaining", 0) <= 0:
+        raise HTTPException(status_code=409, detail="Cuota de video agotada o plan inactivo.")
+
+async def consume_quota_s2s(user_id: str):
+    """Descuenta la cuota vía admin S2S (llamado solo cuando el video se completa exitosamente)."""
+    admin_key = settings.SUBSCRIPTION_ADMIN_API_KEY
+    url = f"{settings.SUBSCRIPTION_SERVICE_URL}/api/v1/admin/subscriptions/{user_id}/consume-video"
+    headers = {"X-Admin-Key": admin_key}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            await client.post(url, headers=headers)
+            logger.info(f"Cuota S2S descontada para user {user_id}")
+        except Exception as e:
+            logger.error(f"Error al descontar cuota S2S: {e}")
+
 
 class VideoGenerateResponse(BaseModel):
     video_id: str
     status: str
 
 @router.post("/generate", response_model=VideoGenerateResponse, status_code=status.HTTP_202_ACCEPTED)
+@limiter.limit("5/minute")
 async def generate_video(
+    request: Request,
     images: List[UploadFile] = File(...),
     prompt_veo_visual: str = Form(...),
     prompt_veo_audio: str = Form(""),
     aspect_ratio: str = Form("16:9"),
     script_text: str = Form(""),
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id),
+    credentials: HTTPAuthorizationCredentials = Depends(security)
 ):
     try:
         if len(images) > 3:
             raise HTTPException(status_code=400, detail="No se permiten más de 3 imágenes por solicitud para generar videos.")
+            
+        # 1. Verificar elegibilidad primero sin descontar
+        token = credentials.credentials
+        await verify_can_generate(token)
+
             
         video_id = str(uuid.uuid4())
         # We give Veo a directory prefix to output the generated video utilizing our local UUID
@@ -66,8 +115,11 @@ async def generate_video(
             video_id=video_id,
             status="PROCESSING"
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error starting video generation: {e}")
+        # Ya no devolvemos cuota porque nunca la consumimos
         raise HTTPException(status_code=500, detail=str(e))
 
 class VideoExtendRequest(BaseModel):
@@ -77,12 +129,18 @@ class VideoExtendRequest(BaseModel):
     script_text: str = ""
 
 @router.post("/extend", response_model=VideoGenerateResponse, status_code=status.HTTP_202_ACCEPTED)
-async def extend_video(req: VideoExtendRequest, user_id: str = Depends(get_current_user_id)):
+@limiter.limit("5/minute")
+async def extend_video(req: VideoExtendRequest, request: Request, user_id: str = Depends(get_current_user_id), credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
         # Verify the original video exists and is completed
         job = get_video_job(req.video_id)
         if not job or job.get("status") != "COMPLETED":
             raise HTTPException(status_code=400, detail="Original video not found or not completed.")
+            
+        # 1. Verificar elegibilidad primero
+        token = credentials.credentials
+        await verify_can_generate(token)
+
             
         new_video_id = str(uuid.uuid4())
         
@@ -125,10 +183,12 @@ async def extend_video(req: VideoExtendRequest, user_id: str = Depends(get_curre
         raise
     except Exception as e:
         logger.error(f"Error starting video extension: {e}")
+        # Ya no devolvemos cuota porque nunca la descontamos
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/list")
-async def get_all_videos():
+@limiter.limit("30/minute")
+async def get_all_videos(request: Request):
     try:
         jobs = list_video_jobs()
         updated_jobs = []
@@ -152,7 +212,8 @@ async def get_all_videos():
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/my-videos")
-async def get_user_videos(user_id: str = Depends(get_current_user_id)):
+@limiter.limit("30/minute")
+async def get_user_videos(request: Request, user_id: str = Depends(get_current_user_id)):
     try:
         jobs = list_video_jobs_by_user(user_id)
         updated_jobs = []
@@ -177,7 +238,8 @@ async def get_user_videos(user_id: str = Depends(get_current_user_id)):
 
 
 @router.get("/status/{video_id:path}")
-async def get_video_status(video_id: str):
+@limiter.limit("60/minute")
+async def get_video_status(video_id: str, request: Request):
     try:
         # Check Firestore first
         job = get_video_job(video_id)
@@ -296,11 +358,20 @@ async def get_video_status(video_id: str):
                 }
 
             # Update Firestore with completion
-            update_video_job(video_id, {
+            user_id = job.get("user_id")
+            quota_consumed = job.get("quota_consumed", False)
+            
+            update_data = {
                 "status": "COMPLETED",
                 "final_url": video_url,
                 "gcs_uri": gcs_uri
-            })
+            }
+
+            if not quota_consumed and user_id:
+                await consume_quota_s2s(user_id)
+                update_data["quota_consumed"] = True
+
+            update_video_job(video_id, update_data)
 
             return {
                 "video_id": video_id,
