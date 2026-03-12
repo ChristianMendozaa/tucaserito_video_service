@@ -3,7 +3,9 @@ from typing import List
 import logging
 import urllib.parse
 import httpx
+import asyncio
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, status, Depends, Request
+
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from cachetools import TTLCache
@@ -24,6 +26,14 @@ security = HTTPBearer()
 
 # Cache to avoid spamming the subscription service on burst requests
 subs_cache = TTLCache(maxsize=1000, ttl=30)
+
+# Locks in-memory to prevent concurrency race conditions on quota deduction
+status_locks = {}
+
+def get_video_lock(video_id: str) -> asyncio.Lock:
+    if video_id not in status_locks:
+        status_locks[video_id] = asyncio.Lock()
+    return status_locks[video_id]
 
 async def verify_can_generate(token: str):
     """Verifica si el plan permite generar videos (sin descontar cuota). Con Caché de 30s."""
@@ -357,21 +367,39 @@ async def get_video_status(video_id: str, request: Request):
                     "error": err_msg
                 }
 
-            # Update Firestore with completion
-            user_id = job.get("user_id")
-            quota_consumed = job.get("quota_consumed", False)
-            
-            update_data = {
-                "status": "COMPLETED",
-                "final_url": video_url,
-                "gcs_uri": gcs_uri
-            }
+            # Update Firestore with completion using a Lock to prevent Race Conditions
+            async with get_video_lock(video_id):
+                # Re-fetch job inside lock to ensure no other concurrent request already processed it
+                latest_job = get_video_job(video_id)
+                if not latest_job:
+                    raise HTTPException(status_code=404, detail="Job disappeared.")
+                
+                if latest_job.get("status") == "COMPLETED":
+                    return {
+                        "video_id": video_id,
+                        "status": "COMPLETED",
+                        "video_url": latest_job.get("final_url"),
+                        "raw_response": op_status.get("response", {})
+                    }
 
-            if not quota_consumed and user_id:
-                await consume_quota_s2s(user_id)
-                update_data["quota_consumed"] = True
+                user_id = latest_job.get("user_id")
+                quota_consumed = latest_job.get("quota_consumed", False)
+                
+                update_data = {
+                    "status": "COMPLETED",
+                    "final_url": video_url,
+                    "gcs_uri": gcs_uri
+                }
 
-            update_video_job(video_id, update_data)
+                if not quota_consumed and user_id:
+                    try:
+                        await consume_quota_s2s(user_id)
+                        update_data["quota_consumed"] = True
+                    except Exception as e:
+                        logger.error(f"Failed to consume quota for {video_id}: {e}")
+                        # If quota deduction fails, we still mark it as completed but leave quota_consumed as False / mark it for retry
+                
+                update_video_job(video_id, update_data)
 
             return {
                 "video_id": video_id,
