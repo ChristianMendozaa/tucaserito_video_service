@@ -42,9 +42,9 @@ def update_video_job(video_id: str, updates: dict) -> None:
         
     doc_ref.update(updates)
 
-def list_video_jobs() -> list:
+def list_video_jobs(limit: int = 100) -> list:
     db = get_firestore_client()
-    docs = db.collection("video_jobs").order_by("created_at", direction=firestore.Query.DESCENDING).stream()
+    docs = db.collection("video_jobs").order_by("created_at", direction=firestore.Query.DESCENDING).limit(limit).stream()
     
     jobs = []
     for doc in docs:
@@ -58,9 +58,9 @@ def list_video_jobs() -> list:
         
     return jobs
 
-def list_video_jobs_by_user(user_id: str) -> list:
+def list_video_jobs_by_user(user_id: str, limit: int = 100) -> list:
     db = get_firestore_client()
-    docs = db.collection("video_jobs").where("user_id", "==", user_id).order_by("created_at", direction=firestore.Query.DESCENDING).stream()
+    docs = db.collection("video_jobs").where("user_id", "==", user_id).order_by("created_at", direction=firestore.Query.DESCENDING).limit(limit).stream()
     
     jobs = []
     for doc in docs:

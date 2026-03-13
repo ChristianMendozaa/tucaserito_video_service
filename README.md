@@ -97,4 +97,10 @@ Devuelve la URL firmada provisoria autorizada en Google Cloud Storage listísima
   "status": "FAILED",
   "error": "The request aspect ratio ASPECT_RATIO_16_9 doesn't match the width 1080 and height 1920."
 }
+
+## Security Policy
+**Atención a nivel de Arquitectura Security (Hardening)**:
+- **No commitear secretos**: Está estrictamente prohibido subir el archivo `.env` o cualquier secreto/llave al control de versiones. Usa siempre `.env.example` como referencia.
+- **X-Admin-Key**: Cualquier llave referida como `X-Admin-Key` o similar es una solución **temporal** (Deuda Técnica). Se debe limitar su exposición estrictamente al backend (Service-to-Service) y jamás debe ser expuesta o enviada desde el navegador del usuario original.
+
 ```

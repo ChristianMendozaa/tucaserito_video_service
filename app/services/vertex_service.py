@@ -67,7 +67,7 @@ async def generate_video_async(
     async with httpx.AsyncClient(timeout=60.0) as client:
         response = await client.post(endpoint, json=payload, headers=headers)
         if response.status_code != 200:
-            raise Exception(f"Vertex AI API Error [{response.status_code}]: {response.text}")
+            raise Exception(f"Vertex AI API Error [{response.status_code}]: {response.text[:200]}...")
             
         data = response.json()
         # Vertex predicting an LRO usually returns an 'name' which is the operation ID
@@ -124,7 +124,7 @@ async def extend_video_async(
     async with httpx.AsyncClient(timeout=60.0) as client:
         response = await client.post(endpoint, json=payload, headers=headers)
         if response.status_code != 200:
-            raise Exception(f"Vertex AI API Error [{response.status_code}]: {response.text}")
+            raise Exception(f"Vertex AI API Error [{response.status_code}]: {response.text[:200]}...")
             
         data = response.json()
         if "name" in data:
@@ -163,6 +163,6 @@ async def get_operation_status(operation_name: str) -> Dict[str, Any]:
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(url, json=payload, headers=headers)
         if response.status_code != 200:
-            raise Exception(f"Failed to get operation status [{response.status_code}]: {response.text}")
+            raise Exception(f"Failed to get operation status [{response.status_code}]: {response.text[:200]}...")
             
         return response.json()

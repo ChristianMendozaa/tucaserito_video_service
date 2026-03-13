@@ -4,7 +4,12 @@ import logging
 import urllib.parse
 import httpx
 import asyncio
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, status, Depends, Request
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, status, Depends, Request, Header
+
+async def verify_admin_key(x_admin_key: str = Header(...)):
+    if x_admin_key != settings.SUBSCRIPTION_ADMIN_API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid admin key")
+    return x_admin_key
 
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -41,29 +46,54 @@ async def verify_can_generate(token: str):
         data = subs_cache[token]
     else:
         url = f"{settings.SUBSCRIPTION_SERVICE_URL}/api/v1/subscriptions/me"
-        headers = {"Authorization": f"Bearer {token}"}
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url, headers=headers)
-            if resp.status_code == 200:
-                data = resp.json()
-                subs_cache[token] = data
-            else:
-                raise HTTPException(status_code=403, detail="No autorizado o sin plan activo.")
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Correlation-ID": str(uuid.uuid4())
+        }
+        
+        data = None
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.get(url, headers=headers)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        subs_cache[token] = data
+                        break
+                    elif resp.status_code in [401, 403, 404]:
+                        raise HTTPException(status_code=403, detail="No autorizado o sin plan activo.")
+                    else:
+                        resp.raise_for_status()
+            except httpx.RequestError as e:
+                logger.warning(f"Error S2S verify_can_generate attempt {attempt+1}: {e}")
+                if attempt == 2:
+                    raise HTTPException(status_code=503, detail="Servicio de suscripciones no disponible.")
+                await asyncio.sleep(1)
 
-    if not data.get("can_generate_video", False) or data.get("videos_remaining", 0) <= 0:
+    if not data or not data.get("can_generate_video", False) or data.get("videos_remaining", 0) <= 0:
         raise HTTPException(status_code=409, detail="Cuota de video agotada o plan inactivo.")
 
-async def consume_quota_s2s(user_id: str):
+async def consume_quota_s2s(user_id: str, video_id: str):
     """Descuenta la cuota vía admin S2S (llamado solo cuando el video se completa exitosamente)."""
     admin_key = settings.SUBSCRIPTION_ADMIN_API_KEY
     url = f"{settings.SUBSCRIPTION_SERVICE_URL}/api/v1/admin/subscriptions/{user_id}/consume-video"
-    headers = {"X-Admin-Key": admin_key}
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    headers = {
+        "X-Admin-Key": admin_key,
+        "X-Correlation-ID": str(uuid.uuid4())
+    }
+    
+    for attempt in range(3):
         try:
-            await client.post(url, headers=headers)
-            logger.info(f"Cuota S2S descontada para user {user_id}")
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(url, headers=headers, json={"video_id": video_id})
+                resp.raise_for_status()
+                logger.info(f"Cuota S2S descontada para user {user_id}")
+                break
         except Exception as e:
-            logger.error(f"Error al descontar cuota S2S: {e}")
+            logger.error(f"Error al descontar cuota S2S attempt {attempt+1}: {e}")
+            if attempt == 2:
+                logger.critical(f"Fallo definitivo al descontar cuota S2S para user {user_id}")
+            await asyncio.sleep(1)
 
 
 class VideoGenerateResponse(BaseModel):
@@ -95,9 +125,20 @@ async def generate_video(
         # We give Veo a directory prefix to output the generated video utilizing our local UUID
         output_uri = get_output_uri(video_id)
 
-        # Veo online prediction takes a single base image. We use the first one provided.
-        image_bytes = await images[0].read()
-        mime_type = images[0].content_type or "image/jpeg"
+        # Configurar límites de subida de archivos (MIME Types y Max 5MB)
+        ALLOWED_MIME_TYPES = ["image/jpeg", "image/png", "image/webp"]
+        MAX_FILE_SIZE = 5 * 1024 * 1024 # 5 MB
+
+        if len(images) > 0:
+            mime_type = images[0].content_type or "image/jpeg"
+            if mime_type not in ALLOWED_MIME_TYPES:
+                raise HTTPException(status_code=400, detail=f"Tipo de archivo no permitido: {mime_type}. Solo JPG/PNG/WEBP.")
+                
+            image_bytes = await images[0].read()
+            if len(image_bytes) > MAX_FILE_SIZE:
+                raise HTTPException(status_code=400, detail=f"La imagen excede el límite de 5MB.")
+        else:
+            raise HTTPException(status_code=400, detail="Se requiere al menos 1 imagen.")
         
         operation_name = await generate_video_async(
             image_bytes=image_bytes,
@@ -129,8 +170,7 @@ async def generate_video(
         raise
     except Exception as e:
         logger.error(f"Error starting video generation: {e}")
-        # Ya no devolvemos cuota porque nunca la consumimos
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Error interno al generar video.")
 
 class VideoExtendRequest(BaseModel):
     video_id: str
@@ -193,12 +233,11 @@ async def extend_video(req: VideoExtendRequest, request: Request, user_id: str =
         raise
     except Exception as e:
         logger.error(f"Error starting video extension: {e}")
-        # Ya no devolvemos cuota porque nunca la descontamos
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Error interno al extender video.")
 
 @router.get("/list")
 @limiter.limit("30/minute")
-async def get_all_videos(request: Request):
+async def get_all_videos(request: Request, admin_key: str = Depends(verify_admin_key)):
     try:
         jobs = list_video_jobs()
         updated_jobs = []
@@ -209,7 +248,7 @@ async def get_all_videos(request: Request):
                 video_id = job.get("video_id")
                 try:
                     # get_video_status will automatically update Firestore if it finished
-                    live_status = await get_video_status(video_id, request)
+                    live_status = await _update_and_get_video_status(video_id)
                     job.update(live_status)
                 except Exception as ex:
                     logger.warning(f"Error auto-updating status for {video_id}: {ex}")
@@ -220,7 +259,7 @@ async def get_all_videos(request: Request):
         return {"videos": updated_jobs}
     except Exception as e:
         logger.error(f"Error listing video jobs: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Error al listar videos.")
 
 @router.get("/my-videos")
 @limiter.limit("30/minute")
@@ -235,7 +274,7 @@ async def get_user_videos(request: Request, user_id: str = Depends(get_current_u
                 video_id = job.get("video_id")
                 try:
                     # get_video_status will automatically update Firestore if it finished
-                    live_status = await get_video_status(video_id, request)
+                    live_status = await _update_and_get_video_status(video_id)
                     job.update(live_status)
                 except Exception as ex:
                     logger.warning(f"Error auto-updating status for {video_id}: {ex}")
@@ -246,12 +285,10 @@ async def get_user_videos(request: Request, user_id: str = Depends(get_current_u
         return {"videos": updated_jobs}
     except Exception as e:
         logger.error(f"Error listing user video jobs: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Error al listar mis videos.")
 
 
-@router.get("/status/{video_id:path}")
-@limiter.limit("60/minute")
-async def get_video_status(video_id: str, request: Request):
+async def _update_and_get_video_status(video_id: str):
     try:
         # Check Firestore first
         job = get_video_job(video_id)
@@ -395,7 +432,7 @@ async def get_video_status(video_id: str, request: Request):
 
                 if not quota_consumed and user_id:
                     try:
-                        await consume_quota_s2s(user_id)
+                        await consume_quota_s2s(user_id, video_id)
                         update_data["quota_consumed"] = True
                     except Exception as e:
                         logger.error(f"Failed to consume quota for {video_id}: {e}")
@@ -420,5 +457,16 @@ async def get_video_status(video_id: str, request: Request):
         raise
     except Exception as e:
         logger.error(f"Error getting video status: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Error interno al buscar el estado del video.")
 
+@router.get("/status/{video_id:path}")
+@limiter.limit("60/minute")
+async def get_video_status_endpoint(video_id: str, request: Request, user_id: str = Depends(get_current_user_id)):
+    job = get_video_job(video_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Video job not found.")
+        
+    if job.get("user_id") != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized to view this video status.")
+        
+    return await _update_and_get_video_status(video_id)
