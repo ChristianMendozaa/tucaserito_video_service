@@ -9,7 +9,7 @@ Debido a las estrictas regulaciones y requisitos de hardware del motor **Veo 3.1
 - **Videos Extendidos (Continuación):** Siempre tendrán una duración forzada de **7 segundos**.
 - Las imágenes proporcionadas inicialmente deben empatar con el `aspect_ratio` físico (ej. foto 9:16 = video 9:16).
 - Los videos se vuelcan *automáticamente* de Vertex AI a nuestro Cloud Storage `pneuma_bucket` evitando el uso intensivo de RAM del servidor en la mayoría de los casos.
-
+ 
 ---
   
 ## 1. Generar Video (Base)
