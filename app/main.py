@@ -19,7 +19,7 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Set up CORS for integration with other services if needed
-allowed_origins_env = os.getenv("ALLOWED_ORIGINS", '["http://localhost:3000", "https://www.tucaserito.com"]')
+allowed_origins_env = os.getenv("ALLOWED_ORIGINS", '["https://www.tucaserito.com"]')
 try:
     origins = json.loads(allowed_origins_env)
 except Exception:

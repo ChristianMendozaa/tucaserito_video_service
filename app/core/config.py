@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     GCS_BUCKET_NAME: str
     GOOGLE_CLOUD_REGION: str
     JWT_SECRET: str
-    SUBSCRIPTION_SERVICE_URL: str = "http://localhost:8003"  # Añadido para interactuar con control de cuotas
+    SUBSCRIPTION_SERVICE_URL: str = ""  # Añadido para interactuar con control de cuotas
     SUBSCRIPTION_ADMIN_API_KEY: str = ""
 
     model_config = SettingsConfigDict(
