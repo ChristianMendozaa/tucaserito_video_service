@@ -235,6 +235,21 @@ async def extend_video(req: VideoExtendRequest, request: Request, user_id: str =
         logger.error(f"Error starting video extension: {e}")
         raise HTTPException(status_code=500, detail="Error interno al extender video.")
 
+def _freshen_job_url(job: dict) -> dict:
+    if job.get("status") == "COMPLETED":
+        gcs_uri = job.get("gcs_uri")
+        video_id = job.get("video_id")
+        if not gcs_uri and video_id:
+            gcs_uri = f"gs://{settings.GCS_BUCKET_NAME}/videos/{video_id}/video.mp4"
+        
+        if gcs_uri and gcs_uri.startswith(f"gs://{settings.GCS_BUCKET_NAME}/"):
+            blob_name = gcs_uri.replace(f"gs://{settings.GCS_BUCKET_NAME}/", "")
+            try:
+                job["final_url"] = generate_signed_url(blob_name)
+            except Exception as e:
+                logger.error(f"Error generating fresh URL for {video_id}: {e}")
+    return job
+
 @router.get("/list")
 @limiter.limit("30/minute")
 async def get_all_videos(request: Request, admin_key: str = Depends(verify_admin_key)):
@@ -254,6 +269,8 @@ async def get_all_videos(request: Request, admin_key: str = Depends(verify_admin
                     logger.warning(f"Error auto-updating status for {video_id}: {ex}")
             # Ensure proper typing for datetime serialization, just in case firestore outputs DatetimeWithNanoseconds
             if job.get("status") != "FAILED":
+                if job.get("status") == "COMPLETED":
+                    job = _freshen_job_url(job)
                 updated_jobs.append(job)
             
         return {"videos": updated_jobs}
@@ -280,6 +297,8 @@ async def get_user_videos(request: Request, user_id: str = Depends(get_current_u
                     logger.warning(f"Error auto-updating status for {video_id}: {ex}")
             # Ensure proper typing for datetime serialization, just in case firestore outputs DatetimeWithNanoseconds
             if job.get("status") != "FAILED":
+                if job.get("status") == "COMPLETED":
+                    job = _freshen_job_url(job)
                 updated_jobs.append(job)
             
         return {"videos": updated_jobs}
@@ -298,10 +317,11 @@ async def _update_and_get_video_status(video_id: str):
         current_status = job.get("status")
         
         if current_status == "COMPLETED":
+            freshened_job = _freshen_job_url(job)
             return {
                 "video_id": video_id,
                 "status": "COMPLETED",
-                "video_url": job.get("final_url")
+                "video_url": freshened_job.get("final_url")
             }
         elif current_status == "FAILED":
             return {
@@ -414,10 +434,11 @@ async def _update_and_get_video_status(video_id: str):
                     raise HTTPException(status_code=404, detail="Job disappeared.")
                 
                 if latest_job.get("status") == "COMPLETED":
+                    freshened_job = _freshen_job_url(latest_job)
                     return {
                         "video_id": video_id,
                         "status": "COMPLETED",
-                        "video_url": latest_job.get("final_url"),
+                        "video_url": freshened_job.get("final_url"),
                         "raw_response": op_status.get("response", {})
                     }
 
